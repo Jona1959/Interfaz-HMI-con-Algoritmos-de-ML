@@ -1,0 +1,402 @@
+# monitor_industrial.py
+# Adquisición en vivo multi-COM (Schneider PM + ADAM + Distancia)
+# Envío con aliases de columnas y refresco automático del Dashboard.
+
+import os, threading, time, csv, math, re, tkinter as tk
+from tkinter import ttk, messagebox
+from datetime import datetime
+
+# ────────── Compatibilidad pymodbus 2.x/3.x ──────────
+try:
+    from pymodbus.client import ModbusSerialClient
+    _PMBR = ">=3"
+except Exception as e1:
+    try:
+        from pymodbus.client.sync import ModbusSerialClient  # pymodbus 1.x/2.x
+        _PMBR = "<3"
+    except Exception as e2:
+        ModbusSerialClient = None  # type: ignore
+        _PM_IMPORT_ERRORS = (e1, e2)
+        _PMBR = "none"
+
+from pymodbus.payload import BinaryPayloadDecoder
+from pymodbus.constants import Endian
+
+try:
+    import serial
+except Exception:
+    serial = None  # type: ignore
+
+# ────────── Config por defecto (ajusta) ──────────
+DEF_PM_COM,  DEF_PM_BAUD, DEF_PM_PAR, DEF_PM_SLAVE = "COM1", 38400, "E", 1
+DEF_ADAM_COM, DEF_ADAM_BAUD, DEF_ADAM_CMD        = "COM6", 9600, "#02"
+DEF_DIST_COM, DEF_DIST_BAUD                      = "COM2", 115200
+
+POLL_SEC = 0.20
+LOG_DIR  = "logs"
+
+REGS_PM = {  # float32 en 2 regs holding
+    "I1 (A)":        2999,
+    "I2 (A)":        3001,
+    "I3 (A)":        3003,
+    "Potencia (kW)": 3059,
+}
+
+# ────────── Helpers de conversión ──────────
+def _volt_to_temp(v):
+    try:
+        vf = float(v)
+        vf = max(1.0, min(5.0, vf))   # recorta a 1–5 V
+        return (vf - 1.0) / 4.0 * 100.0
+    except Exception:
+        return None
+
+_RE_MM = re.compile(r"^\s*(\d+)\s*$")
+_RE_LAST_FLOAT = re.compile(r"([+-]?\d+(?:\.\d+)?)")  # último número en texto
+
+def _decode_float32(res):
+    if not res or not hasattr(res, "registers") or len(res.registers) < 2:
+        return None
+    regs = res.registers[:2]
+    for bo, wo in ((Endian.Big, Endian.Big), (Endian.Big, Endian.Little)):
+        try:
+            dec = BinaryPayloadDecoder.fromRegisters(regs, byteorder=bo, wordorder=wo)
+            v = dec.decode_32bit_float()
+            if math.isfinite(v): return float(v)
+        except Exception:
+            pass
+    return None
+
+def _pm_read_holding(client, address, unit):
+    try:
+        return client.read_holding_registers(address=address, count=2, unit=unit)
+    except TypeError:
+        return client.read_holding_registers(address=address, count=2, slave=unit)
+
+# ────────── Clase principal ──────────
+class MonitorIndustrial(ttk.Frame):
+    EVENT_NAME = "<<HMI_LIVE_DATA>>"  # evento Tk para auto-refresh
+
+    def __init__(self, master, hmi):
+        super().__init__(master)
+        self.master = master
+        self.hmi = hmi
+        self.pack(fill="both", expand=True)
+        self.master.title("Adquisición en Vivo (multi-COM)")
+        self.master.geometry("620x275")
+        self.master.configure(bg="#2d2d2d")
+
+        self.running = False
+        self._lock = threading.Lock()
+        self._pm = None
+        self._ser_adam = None
+        self._ser_dist = None
+        self._th_pm = self._th_adam = self._th_dist = self._th_loop = None
+        self._last_pm = {}
+        self._last_temp = None
+        self._last_dist = None
+        self._log_fp = None
+        self._log_writer = None
+
+        self._build_ui()
+
+    # ────────── UI ──────────
+    def _build_ui(self):
+        s = ttk.Style()
+        s.theme_use("clam")
+        s.configure("TFrame", background="#2d2d2d")
+        s.configure("TLabel", background="#2d2d2d", foreground="white")
+        s.configure("TButton", padding=6)
+
+        r1 = ttk.Frame(self, style="TFrame"); r1.pack(fill="x", padx=10, pady=(10,6))
+        ttk.Label(r1, text="PM COM:").pack(side="left")
+        self.e_pm_com = ttk.Entry(r1, width=7); self.e_pm_com.insert(0, DEF_PM_COM); self.e_pm_com.pack(side="left", padx=4)
+        ttk.Label(r1, text="Baudios:").pack(side="left", padx=(10,0))
+        self.e_pm_baud = ttk.Entry(r1, width=7); self.e_pm_baud.insert(0, str(DEF_PM_BAUD)); self.e_pm_baud.pack(side="left", padx=4)
+        ttk.Label(r1, text="Paridad:").pack(side="left", padx=(10,0))
+        self.e_pm_par = ttk.Entry(r1, width=3); self.e_pm_par.insert(0, DEF_PM_PAR); self.e_pm_par.pack(side="left", padx=4)
+        ttk.Label(r1, text="Slave:").pack(side="left", padx=(10,0))
+        self.e_pm_slave = ttk.Entry(r1, width=4); self.e_pm_slave.insert(0, str(DEF_PM_SLAVE)); self.e_pm_slave.pack(side="left", padx=4)
+
+        r2 = ttk.Frame(self, style="TFrame"); r2.pack(fill="x", padx=10, pady=6)
+        ttk.Label(r2, text="ADAM COM:").pack(side="left")
+        self.e_adam_com = ttk.Entry(r2, width=7); self.e_adam_com.insert(0, DEF_ADAM_COM); self.e_adam_com.pack(side="left", padx=4)
+        ttk.Label(r2, text="Baudios:").pack(side="left", padx=(10,0))
+        self.e_adam_baud = ttk.Entry(r2, width=7); self.e_adam_baud.insert(0, str(DEF_ADAM_BAUD)); self.e_adam_baud.pack(side="left", padx=4)
+        ttk.Label(r2, text="Cmd:").pack(side="left", padx=(10,0))
+        self.e_adam_cmd = ttk.Entry(r2, width=6); self.e_adam_cmd.insert(0, DEF_ADAM_CMD); self.e_adam_cmd.pack(side="left", padx=4)
+
+        r3 = ttk.Frame(self, style="TFrame"); r3.pack(fill="x", padx=10, pady=6)
+        ttk.Label(r3, text="Dist COM:").pack(side="left")
+        self.e_dist_com = ttk.Entry(r3, width=7); self.e_dist_com.insert(0, DEF_DIST_COM); self.e_dist_com.pack(side="left", padx=4)
+        ttk.Label(r3, text="Baudios:").pack(side="left", padx=(10,0))
+        self.e_dist_baud = ttk.Entry(r3, width=7); self.e_dist_baud.insert(0, str(DEF_DIST_BAUD)); self.e_dist_baud.pack(side="left", padx=4)
+
+        r4 = ttk.Frame(self, style="TFrame"); r4.pack(fill="x", padx=10, pady=(6,2))
+        ttk.Button(r4, text="Conectar y Empezar", command=self.start).pack(side="left")
+        ttk.Button(r4, text="Detener", command=self.stop).pack(side="left", padx=8)
+
+        self.lbl = ttk.Label(self, text="Listo", anchor="w"); self.lbl.pack(fill="x", padx=12, pady=(6,10))
+
+    def log(self, txt, ok=True):
+        self.lbl.configure(text=txt, foreground="#9aff9a" if ok else "#ff7373")
+
+    # ────────── START / STOP ──────────
+    def start(self):
+        if self.running: return
+
+        if ModbusSerialClient is None:
+            try:
+                msg = f"No se pudo importar pymodbus:\n{_PM_IMPORT_ERRORS[0]}\n{_PM_IMPORT_ERRORS[1]}"
+            except Exception:
+                msg = "No se pudo importar pymodbus."
+            messagebox.showwarning("pymodbus", msg); return
+        if serial is None:
+            messagebox.showwarning("pySerial", "pySerial no está instalado.\nEj.:  pip install pyserial")
+            return
+
+        # PM
+        try:
+            pm_port  = self.e_pm_com.get().strip()
+            pm_baud  = int(self.e_pm_baud.get().strip() or DEF_PM_BAUD)
+            pm_par   = (self.e_pm_par.get().strip() or "N").upper()[0]
+            pm_slave = int(self.e_pm_slave.get().strip() or DEF_PM_SLAVE)
+            try:
+                self._pm = ModbusSerialClient(method="rtu", port=pm_port, baudrate=pm_baud,
+                                              parity=pm_par, stopbits=1, bytesize=8, timeout=0.2)
+            except TypeError:
+                self._pm = ModbusSerialClient(port=pm_port, baudrate=pm_baud,
+                                              parity=pm_par, stopbits=1, bytesize=8, timeout=0.2)
+            if not self._pm.connect():
+                raise RuntimeError(f"No se pudo abrir {pm_port}")
+            self._pm_slave = pm_slave
+        except Exception as e:
+            self.log(f"PM: {e}", ok=False); self._cleanup_pm(); return
+
+        # ADAM
+        try:
+            adam_port = self.e_adam_com.get().strip()
+            adam_baud = int(self.e_adam_baud.get().strip() or DEF_ADAM_BAUD)
+            self._adam_cmd = (self.e_adam_cmd.get().strip() or DEF_ADAM_CMD).encode("ascii", errors="ignore") + b"\r"
+            self._ser_adam = serial.Serial(adam_port, adam_baud, bytesize=8,
+                                           parity=serial.PARITY_NONE, stopbits=1, timeout=0.2)
+            self._ser_adam.reset_input_buffer()
+        except Exception as e:
+            self.log(f"ADAM: {e}", ok=False); self._cleanup_all(); return
+
+        # Distancia
+        try:
+            dist_port = self.e_dist_com.get().strip()
+            dist_baud = int(self.e_dist_baud.get().strip() or DEF_DIST_BAUD)
+            self._ser_dist = serial.Serial(dist_port, dist_baud, timeout=0.2)
+            self._ser_dist.reset_input_buffer()
+        except Exception as e:
+            self.log(f"Distancia: {e}", ok=False); self._cleanup_all(); return
+
+        # CSV
+        try:
+            os.makedirs(LOG_DIR, exist_ok=True)
+            fn = datetime.now().strftime("live_%Y%m%d_%H%M%S.csv")
+            self._log_fp = open(os.path.join(LOG_DIR, fn), "w", newline="", encoding="utf-8")
+            self._log_writer = csv.DictWriter(
+                self._log_fp,
+                fieldnames=[
+                    "Fecha","Hora",
+                    "I1 (A)","I2 (A)","I3 (A)","Corriente (A)",
+                    "Potencia (kW)","Temperatura (°C)","Distancia (mm)"
+                ]
+            )
+            self._log_writer.writeheader()
+        except Exception as e:
+            self.log(f"CSV: {e}", ok=False); self._cleanup_all(); return
+
+        # Hilos
+        self.running = True
+        self._th_pm   = threading.Thread(target=self._thread_pm,   daemon=True); self._th_pm.start()
+        self._th_adam = threading.Thread(target=self._thread_adam, daemon=True); self._th_adam.start()
+        self._th_dist = threading.Thread(target=self._thread_dist, daemon=True); self._th_dist.start()
+        self._th_loop = threading.Thread(target=self._thread_loop, daemon=True); self._th_loop.start()
+        self.log(f"Conectado: PM {pm_port}, ADAM {self._ser_adam.port}, DIST {self._ser_dist.port}")
+
+    def stop(self):
+        if not self.running:
+            self._cleanup_all(); self.log("Detenido"); return
+        self.running = False
+        for th in (self._th_loop, self._th_pm, self._th_adam, self._th_dist):
+            try:
+                if th and th.is_alive(): th.join(timeout=1.0)
+            except Exception: pass
+        self._cleanup_all(); self.log("Detenido")
+
+    # ────────── Hilos de adquisición ──────────
+    def _thread_pm(self):
+        while self.running and self._pm:
+            pm = {}
+            try:
+                for k, addr in REGS_PM.items():
+                    res = _pm_read_holding(self._pm, addr, self._pm_slave)
+                    if getattr(res, "isError", lambda: True)(): pm={}; break
+                    val = _decode_float32(res)
+                    if val is None: pm={}; break
+                    pm[k] = float(val)
+            except Exception:
+                pm = {}
+            with self._lock:
+                if pm: self._last_pm = pm
+            time.sleep(POLL_SEC)
+
+    def _thread_adam(self):
+        while self.running and self._ser_adam:
+            temp = None
+            try:
+                self._ser_adam.reset_input_buffer()
+                self._ser_adam.write(self._adam_cmd); time.sleep(0.08)
+                raw = self._ser_adam.read(self._ser_adam.in_waiting or 1).decode("utf-8", errors="ignore").strip()
+                if raw:
+                    nums = _RE_LAST_FLOAT.findall(raw)
+                    if nums:
+                        v = float(nums[-1])
+                        temp = _volt_to_temp(v)
+            except Exception:
+                temp = None
+            with self._lock:
+                if temp is not None: self._last_temp = float(temp)
+            time.sleep(POLL_SEC)
+
+    def _thread_dist(self):
+        last = None
+        while self.running and self._ser_dist:
+            try:
+                line = self._ser_dist.readline().decode("utf-8", errors="ignore").strip()
+                m = _RE_MM.match(line)
+                if m: last = float(m.group(1))
+            except Exception:
+                pass
+            if last is not None:
+                with self._lock: self._last_dist = last
+            time.sleep(POLL_SEC * 0.5)
+
+    # ────────── Envío a HMI + auto-refresh ──────────
+    def _send_to_hmi(self, row: dict):
+        def _call_if_exists(obj, names, *a, **k):
+            for name in names:
+                fn = getattr(obj, name, None)
+                if callable(fn):
+                    try: fn(*a, **k); return True
+                    except Exception: pass
+            return False
+
+        def _do():
+            core = getattr(self.hmi, "core", self.hmi)
+
+            # 1) insertar fila
+            inserted = _call_if_exists(core, ["append_row_live","append_row","add_live_row","add_row"], row)
+            if not inserted:
+                try:
+                    data = getattr(core, "data", None)
+                    if isinstance(data, list):
+                        data.append(row); inserted = True
+                except Exception: pass
+
+            # 2) refrescar dashboard si hay métodos
+            _call_if_exists(self.hmi, ["refresh_dashboard","update_dashboard","redraw_dashboard",
+                                       "refresh_plots","update_plots","dash_update"])
+            _call_if_exists(core, ["refresh_dashboard","update_dashboard","redraw_dashboard",
+                                   "refresh_plots","update_plots","dash_update"])
+
+            # 3) disparar evento Tk que puedes enlazar en tu HMI
+            try:
+                self.hmi.master.event_generate(self.EVENT_NAME, when="tail")
+            except Exception: pass
+
+            try:
+                self.hmi.master.update_idletasks()
+            except Exception: pass
+
+        try:
+            self.hmi.master.after(0, _do)
+        except Exception:
+            _do()
+
+    def _thread_loop(self):
+        while self.running:
+            time.sleep(POLL_SEC)
+            with self._lock:
+                pm   = dict(self._last_pm)
+                temp = self._last_temp
+                dist = self._last_dist
+
+            I1 = pm.get("I1 (A)"); I2 = pm.get("I2 (A)"); I3 = pm.get("I3 (A)")
+            Iavg = (I1 + I2 + I3) / 3.0 if all(v is not None for v in (I1, I2, I3)) else (I1 if I1 is not None else None)
+            P = pm.get("Potencia (kW)")
+
+            if Iavg is None and P is None and temp is None and dist is None:
+                continue
+
+            now = datetime.now()
+            row = {
+                "Fecha": now.strftime("%Y-%m-%d"),
+                "Hora":  now.strftime("%H:%M:%S"),
+
+                "I1 (A)": I1 if I1 is not None else 0.0,
+                "I2 (A)": I2 if I2 is not None else 0.0,
+                "I3 (A)": I3 if I3 is not None else 0.0,
+
+                "Corriente (A)": 0.0 if Iavg is None else float(Iavg),
+                "Potencia (kW)": 0.0 if P    is None else float(P),
+                "Temperatura (°C)": 0.0 if temp is None else float(temp),
+                "Distancia (mm)":  0.0 if dist is None else float(dist),
+            }
+
+            # Aliases que tu HMI podría estar usando
+            row["Corriente(A)"]   = row["Corriente (A)"]
+            row["Corrientes (A)"] = row["Corriente (A)"]  # por si usa plural
+            row["Potencia(kW)"]   = row["Potencia (kW)"]
+            for k_alias in ("Temperatura(ºC)","Temperatura(°C)","Temp(ºC)","Temp(°C)","Temp","Temperatura"):
+                row[k_alias] = row["Temperatura (°C)"]
+            row["Distancia(mm)"]  = row["Distancia (mm)"]
+
+            self._send_to_hmi(row)
+
+            # CSV limpio
+            try:
+                if self._log_writer:
+                    self._log_writer.writerow({
+                        "Fecha": row["Fecha"], "Hora": row["Hora"],
+                        "I1 (A)": row["I1 (A)"], "I2 (A)": row["I2 (A)"], "I3 (A)": row["I3 (A)"],
+                        "Corriente (A)": row["Corriente (A)"],
+                        "Potencia (kW)": row["Potencia (kW)"],
+                        "Temperatura (°C)": row["Temperatura (°C)"],
+                        "Distancia (mm)": row["Distancia (mm)"],
+                    })
+            except Exception as e:
+                self.log(f"CSV: {e}", ok=False)
+
+            # Estado en ventanita
+            try:
+                msg = f"I={row['Corriente (A)']:.1f}A  P={row['Potencia (kW)']:.2f}kW  T={row['Temperatura (°C)']:.1f}°C  D={row['Distancia (mm)']:.0f}mm"
+                self.log(msg)
+            except Exception:
+                pass
+
+    # ────────── Limpieza ──────────
+    def _cleanup_pm(self):
+        try:
+            if self._pm and getattr(self._pm, "connected", False):
+                self._pm.close()
+        except Exception: pass
+        self._pm = None
+
+    def _cleanup_all(self):
+        self._cleanup_pm()
+        try:
+            if self._ser_adam and self._ser_adam.is_open: self._ser_adam.close()
+        except Exception: pass
+        try:
+            if self._ser_dist and self._ser_dist.is_open: self._ser_dist.close()
+        except Exception: pass
+        self._ser_adam = None; self._ser_dist = None
+        try:
+            if self._log_fp: self._log_fp.flush(); self._log_fp.close()
+        except Exception: pass
+        self._log_fp = None; self._log_writer = None
