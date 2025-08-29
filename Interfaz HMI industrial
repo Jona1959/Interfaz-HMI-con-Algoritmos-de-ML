@@ -1,0 +1,1352 @@
+# hmi_industrial.py – HMI tesis Jonathan Larenas
+
+import os
+import threading
+import joblib
+import logging
+import winsound
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, simpledialog
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import seaborn as sns
+import shap
+from datetime import datetime
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.figure import Figure
+import time
+import math
+from collections import deque  # ← para persistencia de probabilidad
+
+from sklearn.ensemble       import IsolationForest, RandomForestRegressor
+from sklearn.linear_model    import LogisticRegression
+from sklearn.model_selection import TimeSeriesSplit, ParameterGrid
+from sklearn.metrics         import f1_score, roc_auc_score, mean_absolute_error, roc_curve
+from sklearn.calibration     import CalibratedClassifierCV
+from sklearn.base            import BaseEstimator, RegressorMixin
+
+try:
+    from xgboost import XGBClassifier
+except ImportError:
+    XGBClassifier = None
+
+# ───────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    filename="hmi_industrial.log",
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+# ─── Umbrales físicos (dos modos) ─────────────────────────────────
+# Base (histórico) – ya no se usa para etiquetar, solo queda por compatibilidad
+UMBRAL_AMBAR_DIST_BASE   = 4.0     # mm – advertencia (legacy)
+UMBRAL_ROJO_DIST_BASE    = 8.0     # mm – alarma crítica (legacy)
+
+# Sierra: ΔD = |D - 300|
+UMBRAL_AMBAR_DIST_SIERRA = 1.5     # mm – advertencia
+UMBRAL_ROJO_DIST_SIERRA  = 3.0     # mm – alarma crítica
+
+# Baza: ΔD = |D - 300| pero con umbrales más altos (recomendado)
+UMBRAL_AMBAR_DIST_BAZA   = 30.0    # mm – advertencia
+UMBRAL_ROJO_DIST_BAZA    = 45.0    # mm – alarma crítica
+
+SAMPLES_CONST_2S         = 8       # 2 s a 4 Hz persistencia
+
+# ─── Offset del sensor (mm) ───────────────────────────────────────
+SENSOR_OFFSET            = 300.0   # mm desde láser hasta madera / plano de referencia
+
+# ─── Otros umbrales ───────────────────────────────────────────────
+UMBRAL_AMBAR_I           = 70.0    # A – advertencia
+UMBRAL_ROJO_I            = 110.0   # A – alarma crítica
+UMBRAL_ROJO_I_FLASH      = 120     # A – sobre-corriente instantánea
+SAMPLES_I_ROJO           = 16      # 4 s a 4 Hz (ajusta según muestreo)
+FLASH_I_SAMPLES          = 8       # 2 s
+
+UMBRAL_AMBAR_T           = 40.0    # °C – advertencia
+UMBRAL_ROJO_T            = 55.0    # °C – alarma crítica
+SAMPLES_T_ROJO           = 5       # ≈1.25 s
+
+# ─── Automático RUL ───────────────────────────────────────────────
+AUTO_RUL_ROWS            = 500     # filas para auto-entrenar RUL
+RUL_SEC_PER_CUT          = 4       # segundos por corte (estimado)
+
+# ─── Umbrales de probabilidad del clasificador ───────────────────
+PROB_AMBAR               = 0.60
+PROB_ROJO                = 0.85
+
+# ───────────────────────────────────────────────────────────────────
+
+# 0 ▸ Regresor ingenuo para RUL
+class NaiveLastValueRegressor(BaseEstimator, RegressorMixin):
+    def fit(self, X, y=None): return self
+    def predict(self, X):    return np.repeat(X.iloc[-1, 0], len(X))
+
+# 1 ▸ Core de datos + ML
+class Core:
+    def __init__(self):
+        self.df = self.view = None
+        self.features = []
+        self.features_for_clf = None
+        self.features_for_reg = None
+        self.clf = self.clf_bal = self.clf_xgb = None
+        self.reg = self.iforest = None
+        self.model_dir = "modelos"; os.makedirs(self.model_dir, exist_ok=True)
+        self.last_metrics = {}
+        self.lock = threading.Lock()
+
+        # ► modo de distancia (Sierra/Baza) – lo sincroniza la GUI
+        self.mode = "Sierra"
+
+    # ---------- carga CSV ----------
+    def load_csv(self, path: str):
+        df = pd.read_csv(path, sep=None, engine="python", decimal=",")
+        df.rename(columns={
+            "Temperatura(ÂºC)": "Temperatura(ºC)",
+            "Temp (°C)":       "Temperatura(ºC)",
+            "Temperatura (°C)":"Temperatura(ºC)",
+            "Temperatura(°C)": "Temperatura(ºC)",
+            "Distancia(mm)":   "Distancia(mm)",
+            "Dist (mm)":       "Distancia(mm)",
+            "Potencia (kW)":   "Potencia(kW)",
+            "Potencia(kW)":    "Potencia(kW)",
+            "Corriente(A)":    "Corriente(A)",
+            "L1 RMS A":        "I1 (A)",
+            "L2 RMS A":        "I2 (A)",
+            "L3 RMS A":        "I3 (A)",
+            "I-L1":            "I1 (A)",
+            "I-L2":            "I2 (A)",
+            "I-L3":            "I3 (A)"
+        }, inplace=True)
+
+        if "timestamp_iso" in df and "Fecha" not in df:
+            ts = pd.to_datetime(df["timestamp_iso"], errors="coerce")
+            df["Fecha"] = ts.dt.strftime("%Y-%m-%d")
+            df["Hora"]  = ts.dt.strftime("%H:%M:%S")
+
+        fases = [c for c in ("I1 (A)", "I2 (A)", "I3 (A)") if c in df]
+        if fases and "Corriente(A)" not in df:
+            df["Corriente(A)"] = df[fases].mean(axis=1)
+
+        with self.lock:
+            self.df = self.view = df.copy()
+            self._ensure_corriente()
+            self.ensure_datetime()
+            self.features = []
+            self.features_for_clf = None
+            self.features_for_reg = None
+        logging.info("CSV cargado: %d filas", len(df))
+
+    # ---------- helpers de derivadas/tiempo ----------
+    def _ensure_corriente(self):
+        fases = [c for c in ("I1 (A)", "I2 (A)", "I3 (A)") if c in self.df.columns]
+        if fases:
+            self.df["Corriente(A)"] = self.df[fases].mean(axis=1)
+        self.view = self.df.copy()
+
+    def ensure_datetime(self):
+        if self.view is None or self.view.empty:
+            return
+        df = self.view
+        ts = None
+        if {"Fecha","Hora"} <= set(df.columns):
+            ts = pd.to_datetime(
+                df["Fecha"].astype(str).str.strip() + " " + df["Hora"].astype(str).str.strip(),
+                errors="coerce"
+            )
+        if ts is None or ts.isna().all():
+            for cand in ("Fecha_Hora","timestamp_iso","timestamp","FechaHora","fecha_hora","Datetime","DateTime"):
+                if cand in df.columns:
+                    ts = pd.to_datetime(df[cand], errors="coerce")
+                    break
+        if ts is not None and not ts.isna().all():
+            self.view["Fecha_Hora"] = ts
+        else:
+            base = pd.Timestamp.now().normalize()
+            self.view["Fecha_Hora"] = base + pd.to_timedelta(np.arange(len(df))*0.25, unit="s")
+
+    # ---------- añadir fila (simulación / viva) ----------
+    def append_row(self, row):
+        # Normaliza nombres por si el módulo vivo trae variantes:
+        aliases = {
+            "Temperatura(ÂºC)": "Temperatura(ºC)",
+            "Temperatura (°C)": "Temperatura(ºC)",
+            "Temperatura(°C)":  "Temperatura(ºC)",
+            "Temp (°C)":        "Temperatura(ºC)",
+            "Dist (mm)":        "Distancia(mm)",
+            "Potencia (kW)":    "Potencia(kW)",
+        }
+        row = {aliases.get(k, k): v for k, v in dict(row).items()}
+        with self.lock:
+            self.df = pd.concat([self.df, pd.DataFrame([row])], ignore_index=True) if self.df is not None else pd.DataFrame([row])
+            self._ensure_corriente()
+            self.view = self.df.copy()
+            self.ensure_datetime()
+            self.make_features()
+
+    # ---------- filtros ----------
+    def filter_date(self, date):
+        self.view = self.df[self.df["Fecha"] == date]
+    def filter_hours(self, ini, fin):
+        hi = pd.to_datetime(ini).time(); hf = pd.to_datetime(fin).time()
+        t  = pd.to_datetime(self.view["Hora"]).dt.time
+        self.view = self.view[(t >= hi) & (t <= hf)]
+
+    # ---------- features ----------
+    def make_features(self, wins=(8, 30)):
+        if self.view is None:
+            return
+        df = self.view.copy()
+        feats = []
+        num = ["I1 (A)", "I2 (A)", "I3 (A)", "Potencia(kW)",
+               "Temperatura(ºC)", "Distancia(mm)", "Corriente(A)"]
+        for col in num:
+            if col in df:
+                for w in wins:
+                    df[f"{col}_ma{w}"]  = df[col].rolling(w, 1).mean()
+                    df[f"{col}_std{w}"] = df[col].rolling(w, 1).std()
+                    feats += [f"{col}_ma{w}", f"{col}_std{w}"]
+        if {"Potencia(kW)", "Temperatura(ºC)"} <= set(df):
+            df["Carga_termica"] = df["Potencia(kW)"] * df["Temperatura(ºC)"]
+            feats.append("Carga_termica")
+        # también incluir crudas para sensibilidad instantánea
+        raw = ["Corriente(A)", "Temperatura(ºC)", "Distancia(mm)", "Potencia(kW)", "I1 (A)", "I2 (A)", "I3 (A)"]
+        feats += [c for c in raw if c in df]
+        self.view = df
+        self.features = feats
+
+    # ---------- helper X,y ----------
+    def _make_Xy(self):
+        self.make_features()
+        d = self.view.dropna(subset=self.features) if self.features else self.view.copy()
+
+        # Distancia: ΔD = |D - 300| y persistencia 2 s para marcar rojo
+        if "Distancia(mm)" in d:
+            delta = (d["Distancia(mm)"].astype(float) - SENSOR_OFFSET).abs()
+            const_dist = (
+                d["Distancia(mm)"].diff().abs()
+                .rolling(SAMPLES_CONST_2S, min_periods=SAMPLES_CONST_2S)
+                .sum() < 1e-6
+            )
+            # umbral rojo según modo
+            red_thr = UMBRAL_ROJO_DIST_SIERRA if getattr(self, "mode", "Sierra") == "Sierra" else UMBRAL_ROJO_DIST_BAZA
+            d_roja = (delta >= red_thr).rolling(SAMPLES_CONST_2S, min_periods=SAMPLES_CONST_2S).sum() == SAMPLES_CONST_2S
+        else:
+            const_dist = pd.Series(False, index=d.index)
+            d_roja = pd.Series(False, index=d.index)
+
+        # Corriente alta y flash
+        if "Corriente(A)" in d:
+            i_roja  = d["Corriente(A)"].ge(UMBRAL_ROJO_I).rolling(SAMPLES_I_ROJO).sum() == SAMPLES_I_ROJO
+            i_flash = d["Corriente(A)"].ge(UMBRAL_ROJO_I_FLASH).rolling(FLASH_I_SAMPLES).sum() == FLASH_I_SAMPLES
+        else:
+            i_roja = i_flash = pd.Series(False, index=d.index)
+
+        # Temperatura alta
+        if "Temperatura(ºC)" in d:
+            t_roja = d["Temperatura(ºC)"].ge(UMBRAL_ROJO_T).rolling(SAMPLES_T_ROJO).sum() == SAMPLES_T_ROJO
+        else:
+            t_roja = pd.Series(False, index=d.index)
+
+        d["Falla"] = (i_roja | i_flash | t_roja | d_roja | const_dist).astype(int)
+        return (d[self.features] if self.features else d.iloc[:,0:0]), d["Falla"]
+
+    # ---------- métricas y entrenamiento ----------
+    def train_failure(self):
+        with self.lock:
+            X, y = self._make_Xy()
+        n = int(len(X) * 0.8)
+        Xt, Xs, yt, ys = X.iloc[:n], X.iloc[n:], y.iloc[:n], y.iloc[n:]
+        m = LogisticRegression(max_iter=1000)
+        try:
+            m.fit(Xt, yt)
+            f1  = f1_score(ys, m.predict(Xs))
+            roc = roc_auc_score(ys, m.predict_proba(Xs)[:,1])
+        except ValueError:
+            f1 = roc = np.nan
+        with self.lock:
+            self.clf = m.fit(X, y)
+            self.features_for_clf = list(self.features)
+            joblib.dump(self.clf, f"{self.model_dir}/logreg_split80_20.joblib")
+            self.last_metrics["F1_Log"]  = (f1, 0)
+            self.last_metrics["ROC_Log"] = (roc, 0)
+        return f1, roc
+
+    def train_failure_balanced(self):
+        with self.lock:
+            X, y = self._make_Xy()
+        n = int(len(X) * 0.8)
+        Xt, Xs, yt, ys = X.iloc[:n], X.iloc[n:], y.iloc[:n], y.iloc[n:]
+        base = LogisticRegression(max_iter=1000, class_weight="balanced")
+        m = CalibratedClassifierCV(base, cv=3, method="sigmoid")
+        try:
+            m.fit(Xt, yt)
+            f1  = f1_score(ys, m.predict(Xs))
+            roc = roc_auc_score(ys, m.predict_proba(Xs)[:,1])
+        except ValueError:
+            f1 = roc = np.nan
+        with self.lock:
+            m.fit(X, y)
+            self.clf_bal = m
+            self.features_for_clf = list(self.features)
+            joblib.dump(self.clf_bal, f"{self.model_dir}/logreg_balanced.joblib")
+            self.last_metrics["F1_LogBal"]  = (f1, 0)
+            self.last_metrics["ROC_LogBal"] = (roc, 0)
+        return f1, roc
+
+    def train_failure_xgb(self):
+        if XGBClassifier is None:
+            raise ImportError("Necesitas instalar XGBoost: pip install xgboost")
+        with self.lock:
+            X, y = self._make_Xy()
+        n = int(len(X) * 0.8)
+        Xt, Xs, yt, ys = X.iloc[:n], X.iloc[n:], y.iloc[:n], y.iloc[n:]
+        m = XGBClassifier(
+            n_estimators=300, max_depth=4, learning_rate=0.05,
+            subsample=0.8, colsample_bytree=0.8,
+            objective="binary:logistic", eval_metric="logloss",
+            random_state=42, n_jobs=-1
+        )
+        try:
+            m.fit(Xt, yt)
+            f1  = f1_score(ys, m.predict(Xs))
+            roc = roc_auc_score(ys, m.predict_proba(Xs)[:,1])
+        except ValueError:
+            f1 = roc = np.nan
+        with self.lock:
+            m.fit(X, y)
+            self.clf_xgb = m
+            self.features_for_clf = list(self.features)
+            joblib.dump(self.clf_xgb, f"{self.model_dir}/xgb_failures.joblib")
+            self.last_metrics["F1_XGB"]  = (f1, 0)
+            self.last_metrics["ROC_XGB"] = (roc, 0)
+        return f1, roc
+
+    def train_failure_cv(self):
+        with self.lock:
+            X, y = self._make_Xy()
+        N = len(X)
+        splits = []
+        for off in np.linspace(0, 0.4, 5):
+            a, b = int((0.6+off)*N), int((0.8+off)*N)
+            if b >= N: break
+            splits.append((a, b))
+        f1s, rocs = [], []
+        for a, b in splits:
+            y_train = y.iloc[:a]
+            if len(np.unique(y_train)) < 2: continue
+            m = LogisticRegression(max_iter=1000, class_weight="balanced")
+            m.fit(X.iloc[:a], y_train)
+            try:
+                f1s.append(f1_score(y.iloc[a:b], m.predict(X.iloc[a:b])))
+                rocs.append(roc_auc_score(y.iloc[a:b], m.predict_proba(X.iloc[a:b])[:,1]))
+            except ValueError:
+                f1s.append(np.nan); rocs.append(np.nan)
+        with self.lock:
+            self.clf = LogisticRegression(max_iter=1000, class_weight="balanced").fit(X, y)
+            self.features_for_clf = list(self.features)
+            self.last_metrics["F1_cv"]  = (np.nanmean(f1s),  np.nanstd(f1s))
+            self.last_metrics["ROC_cv"] = (np.nanmean(rocs), np.nanstd(rocs))
+        return self.last_metrics["F1_cv"], self.last_metrics["ROC_cv"]
+
+    # Isolation Forest
+    def train_isolation(self):
+        with self.lock:
+            self.make_features()
+            X = self.view[self.features].fillna(0) if self.features else self.view.iloc[:,0:0]
+            self.iforest = IsolationForest(contamination=0.02, random_state=42).fit(X)
+            joblib.dump(self.iforest, f"{self.model_dir}/iforest.joblib")
+        return self.view[self.iforest.predict(X) == -1] if self.features else self.view.iloc[0:0]
+
+    # --------- Helpers RUL robustos ---------
+    def _check_distance_available(self):
+        return (self.view is not None and "Distancia(mm)" in self.view.columns
+                and not self.view["Distancia(mm)"].isna().all())
+
+    def _prepare_rul_frame(self):
+        self.make_features()
+        feats = list(self.features)
+        if not feats:
+            raise ValueError("RUL no disponible: aún no hay features (rolling). "
+                             "Espera ~30 muestras o reduce el window.")
+        d = self.view.dropna(subset=feats).copy()
+        if d.empty or len(d) < 30:
+            raise ValueError("RUL no disponible: muy pocos datos válidos tras el rolling.")
+        for req in ("Corriente(A)", "Temperatura(ºC)", "Distancia(mm)"):
+            if req not in d.columns:
+                raise ValueError("RUL requiere Corriente(A), Temperatura(ºC) y Distancia(mm).")
+        d["Desgaste"] = (d["Corriente(A)"] * d["Temperatura(ºC)"] * d["Distancia(mm)"]) / 10000.0
+        d["RUL"]      = d["Desgaste"].max() - d["Desgaste"]
+        return d, feats
+
+    def train_rul(self):
+        with self.lock:
+            if not self._check_distance_available():
+                raise ValueError("RUL no disponible: señal Distancia(mm) ausente o vacía.")
+            d, feats = self._prepare_rul_frame()
+        X, y = d[feats], d["RUL"]
+        maes, r = [], None
+        for tr, val in TimeSeriesSplit(5).split(X):
+            r = RandomForestRegressor(n_estimators=400, random_state=42)
+            r.fit(X.iloc[tr], y.iloc[tr])
+            maes.append(mean_absolute_error(y.iloc[val], r.predict(X.iloc[val])))
+        with self.lock:
+            self.reg = r.fit(X, y)
+            self.features_for_reg = list(feats)
+            joblib.dump(self.reg, f"{self.model_dir}/rf_rul.joblib")
+            self.last_metrics["MAE_RF"] = (float(np.mean(maes)), 0.0)
+        return float(np.mean(maes))
+
+    def train_rul_grid(self):
+        with self.lock:
+            if not self._check_distance_available():
+                raise ValueError("RUL no disponible: señal Distancia(mm) ausente o vacía.")
+            d, feats = self._prepare_rul_frame()
+        X, y = d[feats], d["RUL"]
+        grid = ParameterGrid({"n_estimators":[200,400,800], "max_depth":[None,8,16]})
+        best_mae, best_p, best_model = float("inf"), None, None
+        for p in grid:
+            maes = []
+            for tr, val in TimeSeriesSplit(5).split(X):
+                r = RandomForestRegressor(**p, random_state=42)
+                r.fit(X.iloc[tr], y.iloc[tr])
+                maes.append(mean_absolute_error(y.iloc[val], r.predict(X.iloc[val])))
+            m = float(np.mean(maes))
+            if m < best_mae:
+                best_mae, best_p, best_model = m, p, r
+        with self.lock:
+            self.reg = best_model.fit(X, y)
+            self.features_for_reg = list(feats)
+            joblib.dump(self.reg, f"{self.model_dir}/rf_rul_grid.joblib")
+            self.last_metrics["MAE_RF"] = (best_mae, 0.0)
+        return best_mae, best_p
+
+    def compare_rul_models(self):
+        with self.lock:
+            if not self._check_distance_available():
+                raise ValueError("RUL no disponible: señal Distancia(mm) ausente o vacía.")
+            d, feats = self._prepare_rul_frame()
+        X, y = d[feats], d["RUL"]
+        mae_naive = mean_absolute_error(y, NaiveLastValueRegressor().predict(X))
+        if self.reg is None:
+            self.train_rul_grid()
+        mae_rf = mean_absolute_error(y, self.reg.predict(X))
+        with self.lock:
+            self.last_metrics["MAE_cmp"] = (float(mae_rf), float(mae_naive))
+        return float(mae_rf), float(mae_naive)
+
+    # Predict live
+    def predict_live(self):
+        with self.lock:
+            if self.view is None or self.view.empty:
+                return None
+            self.make_features()
+            clf = self.clf_xgb or self.clf_bal or self.clf
+
+            req_clf = self.features_for_clf or self.features
+            req_reg = self.features_for_reg or self.features
+
+            prob = None
+            rul  = None
+
+            # Prob del clasificador (independiente de RUL)
+            if clf is not None and set(req_clf).issubset(self.view.columns):
+                Xc = self.view.iloc[[-1]][req_clf].fillna(0)
+                try:
+                    prob = float(clf.predict_proba(Xc)[:, 1][0])
+                except Exception:
+                    prob = None
+
+            # RUL solo si hay modelo
+            if self.reg is not None and set(req_reg).issubset(self.view.columns):
+                Xr = self.view.iloc[[-1]][req_reg].fillna(0)
+                try:
+                    rul = float(self.reg.predict(Xr)[0])
+                except Exception:
+                    rul = None
+
+            return prob, rul
+
+    # Anomalías
+    def anomalies(self):
+        with self.lock:
+            self.make_features()
+            X = self.view[self.features].fillna(0) if self.features else self.view.iloc[:,0:0]
+            if self.iforest is None:
+                self.iforest = IsolationForest(contamination=0.02, random_state=42).fit(X)
+                joblib.dump(self.iforest, f"{self.model_dir}/iforest.joblib")
+        return self.view[self.iforest.predict(X) == -1] if self.features else self.view.iloc[0:0]
+
+    # Energía
+    def energy_summary(self):
+        with self.lock:
+            if "Potencia(kW)" in self.view:
+                e = self.view["Potencia(kW)"].sum()/3600*0.25
+            else:
+                p = self.view["Corriente(A)"]*math.sqrt(3)*380*0.84/1000
+                e = p.sum()/3600*0.25
+        return e, e*200
+
+    # ─── Helpers para el PDF ───────────────────────────────────────
+    def dataset_summary(self):
+        if self.view is None or self.view.empty:
+            return {"rows":0}
+        d = self.view.copy()
+        e, c = self.energy_summary()
+        ts = None
+        if "Fecha_Hora" in d:
+            ts = pd.to_datetime(d["Fecha_Hora"], errors="coerce")
+        elif {"Fecha","Hora"} <= set(d.columns):
+            ts = pd.to_datetime(d["Fecha"] + " " + d["Hora"], errors="coerce")
+        ts = ts.dropna() if ts is not None else None
+        if ts is not None and len(ts) >= 3:
+            dt = ts.sort_values().diff().dt.total_seconds().median()
+            hz = (1.0/dt) if (dt and dt>0) else np.nan
+            t0, t1 = ts.min(), ts.max()
+        else:
+            dt = np.nan; hz = np.nan; t0 = t1 = None
+        return {"rows":len(d), "kwh":e, "cost":c, "dt":dt, "hz":hz, "t0":t0, "t1":t1}
+
+    def eval_classifiers_curves(self):
+        if self.view is None or self.view.empty:
+            return {}
+        X, y = self._make_Xy()
+        if X is None or X.empty or y is None or y.empty:
+            return {}
+        n = int(len(X)*0.8)
+        if n==0 or n==len(X):
+            return {}
+        Xt, Xs, yt, ys = X.iloc[:n], X.iloc[n:], y.iloc[:n], y.iloc[n:]
+        out = {}
+        modelos = []
+        if self.clf is not None:      modelos.append(("LogReg", self.clf))
+        if self.clf_bal is not None:  modelos.append(("LogBal", self.clf_bal))
+        if self.clf_xgb is not None:  modelos.append(("XGB",    self.clf_xgb))
+        for nombre, m in modelos:
+            try:
+                p = m.predict_proba(Xs)[:,1]
+                fpr, tpr, _ = roc_curve(ys, p)
+                auc = roc_auc_score(ys, p)
+                f1  = f1_score(ys, (p>=0.5).astype(int))
+                out[nombre] = {"fpr":fpr, "tpr":tpr, "auc":float(auc), "f1":float(f1)}
+            except Exception:
+                continue
+        return out
+
+    def rul_eval_points(self):
+        if not self._check_distance_available():
+            return None
+        d, feats = self._prepare_rul_frame()
+        X, y = d[feats], d["RUL"]
+        if self.reg is None:
+            self.train_rul()
+        yhat = self.reg.predict(X)
+        mae = mean_absolute_error(y, yhat)
+        return {"y":y.values, "yhat":yhat, "mae":float(mae)}
+
+    def best_shap_model(self):
+        if self.clf_xgb is not None:   return self.clf_xgb, "xgb"
+        if self.clf_bal is not None:   return self.clf_bal, "logbal"
+        if self.clf is not None:       return self.clf,    "log"
+        return None, None
+
+# 2 ▸ GUI Industrial
+class IndustrialHMI(ttk.Frame):
+    def __init__(self, master):
+        super().__init__(master)
+        self.pack(fill="both", expand=True)
+        master.title("HMI – Sierra Industrial / Tesis")
+        master.geometry("1180x800")
+        master.configure(bg="#2d2d2d")
+
+        self.core = Core()
+        self.running = False
+        self.pause_evt = threading.Event()
+        self._player_thread = None
+        self._sim_token = 0
+        self._auto_rul_trained = False
+        self._last_red = False
+
+        self.dash_interval = 500    # ms
+        self._next_dash_ms = 0
+        self.dist_mode = tk.StringVar(value="Sierra")
+
+        # refs de dashboard (persistentes)
+        self._dash_built = False
+        self.fig = None
+        self.axes = []
+        self.canvas = None
+        self.toolbar = None
+        self.lines = {}
+        # control de zoom/sincro X
+        self._x_initialized = False
+        self._user_zoomed = False
+        self._programmatic_xlim_change = False
+
+        # persistencia de probabilidad (2s)
+        self._prob_hist = deque(maxlen=SAMPLES_CONST_2S)
+
+        self._build_style()
+        self._build_ui()
+        master.protocol("WM_DELETE_WINDOW", self.quit)
+
+        # ───────────────────────────────
+        # AUTO-REFRESCO EN VIVO (parche)
+        # Se llama automáticamente cuando el monitor dispara <<HMI_LIVE_DATA>>
+        self.master.bind("<<HMI_LIVE_DATA>>", self._on_live_data)
+        # ───────────────────────────────
+
+    def _build_style(self):
+        s = ttk.Style()
+        s.theme_use("clam")
+        s.configure("Sidebar.TFrame", background="#3c3c3c")
+        s.configure("Sidebar.TButton", background="#5a5a5a",
+                    foreground="white", font=("Segoe UI",11,"bold"), padding=6)
+        s.map("Sidebar.TButton", background=[("active","#707070")])
+        s.configure("Main.TFrame", background="#2d2d2d")
+        s.configure("State.TLabel", background="#2d2d2d",
+                    foreground="#9aff9a", font=("Consolas",11))
+
+    def _build_ui(self):
+        side = ttk.Frame(self, style="Sidebar.TFrame", width=180)
+        side.pack(side="left", fill="y")
+        def sbtn(txt, cmd):
+            ttk.Button(side, text=txt, style="Sidebar.TButton", command=cmd)\
+                .pack(fill="x", pady=2, padx=4)
+
+        sbtn("Cargar CSV",       self.load_csv)
+        sbtn("Simular CSV",      self.simular_csv)
+        sbtn("Pausar/Continuar", self.toggle_pause)
+        sbtn("Adquisición Viva", self.start_live_acquisition)
+
+        ttk.Label(side, text="Modo Distancia:", foreground="white",
+                  background="#3c3c3c", font=("Segoe UI",10)).pack(pady=(10,0))
+        ttk.OptionMenu(side, self.dist_mode, "Sierra", "Sierra", "Baza")\
+            .pack(fill="x", pady=2, padx=4)
+
+        # ► sincroniza el modo del OptionMenu con el Core
+        self.core.mode = self.dist_mode.get()
+        self.dist_mode.trace_add("write", lambda *a: setattr(self.core, "mode", self.dist_mode.get()))
+
+        sbtn("Entrenar Fallas",    self._thread(self.train_fails))
+        sbtn("Fallas Balanceadas", self._thread(self.train_fails_balanced))
+        sbtn("Fallas XGBoost",     self._thread(self.train_fails_xgb))
+        sbtn("Validación CV",      self._thread(self.run_cv))
+        sbtn("Entrenar RUL",       self._thread(self.train_rul))
+        sbtn("RUL GridSearch",     self._thread(self.train_rul_grid))
+        sbtn("Comparar RUL",       self._thread(self.run_rul_cmp))
+        sbtn("SHAP",               self.show_shap)
+        sbtn("Ver Anomalías",      self.show_anom)
+        sbtn("Dashboard",          self.show_dash)
+        sbtn("Reporte PDF",        self._thread(self.make_pdf))
+
+        self.state_lbl = ttk.Label(side, text="Sin archivo", style="State.TLabel")
+        self.state_lbl.pack(fill="x", pady=6, padx=4)
+
+        self.main_area = ttk.Frame(self, style="Main.TFrame")
+        self.main_area.pack(side="right", fill="both", expand=True)
+        self.notebook  = ttk.Notebook(self.main_area)
+        self.tab_dash  = ttk.Frame(self.notebook)
+        self.tab_data  = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_dash, text="Dashboard")
+        self.notebook.add(self.tab_data, text="Datos")
+        self.notebook.pack(fill="both", expand=True)
+
+        self.tree = ttk.Treeview(self.tab_data, show="headings")
+        vsb = ttk.Scrollbar(self.tab_data, orient="vertical",   command=self.tree.yview)
+        hsb = ttk.Scrollbar(self.tab_data, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right",fill="y"); hsb.pack(side="bottom",fill="x")
+
+    def _thread(self, f):
+        return lambda: threading.Thread(target=f, daemon=True).start()
+
+    def log(self, txt, ok=True):
+        self.state_lbl.configure(text=txt,
+            foreground="#9aff9a" if ok else "#ff7373")
+
+    def toggle_pause(self):
+        if not self.running:
+            self.log("No hay simulación activa", ok=False)
+            return
+        if self.pause_evt.is_set():
+            self.pause_evt.clear(); self.log("▶ Simulación reanudada")
+        else:
+            self.pause_evt.set();   self.log("⏸ Simulación en pausa")
+
+    def start_live_acquisition(self):
+        try:
+            win = tk.Toplevel(self.master)
+            win.title("Adquisición en Vivo")
+            from monitor_industrial import MonitorIndustrial
+            MonitorIndustrial(win, self)
+        except Exception as e:
+            messagebox.showwarning("Adquisición Viva",
+                                   "Módulo externo no disponible.\n\n" + str(e))
+
+    # ---- CONTROL ROBUSTO DE SIMULACIÓN ----
+    def stop_simulation(self):
+        """Detiene cualquier simulación en curso y limpia estados."""
+        self.running = False
+        self.pause_evt.clear()
+        self._sim_token += 1  # invalida callbacks pendientes
+        t = self._player_thread
+        if t and t.is_alive():
+            t.join(timeout=0.5)
+        self._player_thread = None
+        self._auto_rul_trained = False
+        self._last_red = False
+        self._user_zoomed = False
+        self._x_initialized = False
+        self._prob_hist.clear()  # ← limpiar persistencia de probabilidad
+        # limpiar tabla y reset de líneas del dashboard
+        self.clear_table()
+        self._dash_reset_data()
+
+    def simular_csv(self):
+        # siempre detener lo previo
+        self.stop_simulation()
+
+        path = filedialog.askopenfilename(title="CSV para reproducir",
+                                          filetypes=[("CSV","*.csv")])
+        if not path:
+            return
+        try:
+            self.core.load_csv(path)
+            df_full = self.core.df.copy()
+
+            # vaciar buffer para reproducir desde cero
+            self.core.df = self.core.view = df_full.iloc[:0].copy()
+            self.core.features = []
+            self.core.features_for_clf = None
+            self.core.features_for_reg = None
+            self.core.ensure_datetime()
+            self.populate_table()
+            self._x_initialized = False
+            self._user_zoomed = False
+
+            self.log(f"Simulando {os.path.basename(path)}")
+            dt = simpledialog.askfloat("Intervalo","Segundos entre filas:",
+                                       initialvalue=0.25, minvalue=0.05)
+            if dt is None:
+                return
+            self.running = True
+            token = self._sim_token
+            th = threading.Thread(target=self._live_csv_player,
+                                  args=(df_full, dt, token),
+                                  daemon=True)
+            self._player_thread = th
+            th.start()
+        except Exception as e:
+            messagebox.showerror("Simular CSV", str(e)); self.log("Err", False)
+
+    def _live_csv_player(self, df, dt, token):
+        for _, row in df.iterrows():
+            if not self.running or token != self._sim_token:
+                break
+            while self.pause_evt.is_set() and self.running and token == self._sim_token:
+                time.sleep(0.05)
+            if not self.running or token != self._sim_token:
+                break
+            self.after(0, self._add_row_gui, row, token)
+            time.sleep(dt)
+        self.after(0, lambda: self.log("✔ Simulación terminada"))
+        self.running = False
+
+    def _refresh_dashboard(self):
+        # siempre refresco (aunque no esté seleccionada la pestaña)
+        self.show_dash()
+
+    def _add_row_gui(self, row, token):
+        if token != self._sim_token or not self.running:
+            return
+        self.core.append_row(row)
+        self.tree.insert("", "end", values=list(row))
+        self._update_status_lamp()
+
+        if not self._auto_rul_trained and len(self.core.view) >= AUTO_RUL_ROWS:
+            self._auto_rul_trained = True
+            threading.Thread(target=self._auto_train_rul, daemon=True).start()
+
+        now = int(time.time() * 1000)
+        if now >= self._next_dash_ms:
+            self._refresh_dashboard()
+            self._next_dash_ms = now + self.dash_interval
+
+    def _auto_train_rul(self):
+        try:
+            self.log("Entrenando RUL…")
+            mae = self.core.train_rul()
+            self.log(f"RUL listo (MAE={mae:.1f})")
+        except Exception as e:
+            self._auto_rul_trained = False
+            self.log(f"RUL pendiente: {e}", ok=False)
+
+    def load_csv(self):
+        self.stop_simulation()  # por si había algo activo
+        f = filedialog.askopenfilename(filetypes=[("CSV","*.csv")])
+        if not f: return
+        try:
+            self.core.load_csv(f)
+            self.populate_table()
+            self._x_initialized = False
+            self._user_zoomed = False
+            self._prob_hist.clear()
+            self.log(os.path.basename(f))
+        except Exception as e:
+            messagebox.showerror("CSV", str(e)); self.log("Err", False)
+        finally:
+            self._refresh_dashboard()
+
+    def clear_table(self):
+        try:
+            self.tree.delete(*self.tree.get_children())
+            self.tree["columns"] = []
+        except Exception:
+            pass
+
+    def populate_table(self):
+        df = self.core.view if self.core.view is not None else pd.DataFrame()
+        self.tree.delete(*self.tree.get_children())
+        self.tree["columns"] = list(df.columns)
+        for c in df.columns:
+            self.tree.heading(c, text=c)
+            self.tree.column(c, width=110, anchor="center")
+        for _, r in df.iterrows():
+            self.tree.insert("", "end", values=list(r))
+
+    def train_fails(self):
+        try:
+            f1, roc = self.core.train_failure()
+            self.log(f"Log F1={f1:.2f} ROC={roc:.2f}")
+        except Exception as e:
+            messagebox.showerror("Fallas", str(e)); self.log("Err", False)
+
+    def train_fails_balanced(self):
+        try:
+            f1, roc = self.core.train_failure_balanced()
+            self.log(f"Bal F1={f1:.2f} ROC={roc:.2f}")
+        except Exception as e:
+            messagebox.showerror("Bal", str(e)); self.log("Err", False)
+
+    def train_fails_xgb(self):
+        try:
+            f1, roc = self.core.train_failure_xgb()
+            self.log(f"XGB F1={f1:.2f} ROC={roc:.2f}")
+        except ImportError as e:
+            messagebox.showwarning("XGB", str(e)); self.log("Err", False)
+        except Exception as e:
+            messagebox.showerror("XGB", str(e)); self.log("Err", False)
+
+    def run_cv(self):
+        try:
+            (m_f1, s_f1), (m_roc, s_roc) = self.core.train_failure_cv()
+            self.log(f"CV F1={m_f1:.2f}±{s_f1:.2f} ROC={m_roc:.2f}±{s_roc:.2f}")
+        except Exception as e:
+            messagebox.showerror("CV", str(e)); self.log("Err", False)
+
+    def train_rul(self):
+        try:
+            mae = self.core.train_rul()
+            self.log(f"MAE={mae:.1f}")
+        except Exception as e:
+            messagebox.showerror("RUL", str(e)); self.log("Err", False)
+
+    def train_rul_grid(self):
+        try:
+            mae, p = self.core.train_rul_grid()
+            self.log(f"Grid MAE={mae:.1f} {p}")
+        except Exception as e:
+            messagebox.showerror("Grid", str(e)); self.log("Err", False)
+
+    def run_rul_cmp(self):
+        try:
+            mae_rf, mae_naive = self.core.compare_rul_models()
+            self.log(f"RF MAE={mae_rf:.1f} / Naive={mae_naive:.1f}")
+        except Exception as e:
+            messagebox.showerror("Cmp", str(e)); self.log("Err", False)
+
+    def show_shap(self):
+        if self.core.view is None or self.core.view.empty or not self.core.features:
+            messagebox.showwarning("SHAP", "Carga datos y entrena un modelo primero")
+            return
+        X = self.core.view[self.core.features].fillna(0)
+        X_bg = X.sample(min(200, len(X)), random_state=42) if len(X) else X
+        try:
+            if self.core.clf_xgb is not None:
+                explainer = shap.TreeExplainer(self.core.clf_xgb)
+                vals = explainer.shap_values(X.tail(400))
+            else:
+                if self.core.clf_bal is not None:
+                    f = lambda data: self.core.clf_bal.predict_proba(
+                        pd.DataFrame(data, columns=X.columns)
+                    )[:,1]
+                    explainer = shap.KernelExplainer(f, X_bg)
+                    vals = explainer.shap_values(X.tail(400), nsamples=200)
+                elif self.core.clf is not None:
+                    explainer = shap.LinearExplainer(self.core.clf, X_bg)
+                    vals = explainer.shap_values(X.tail(400))
+                else:
+                    messagebox.showwarning("SHAP", "Entrena un modelo (XGB o LogReg) primero")
+                    return
+            shap.summary_plot(vals, X.columns.tolist(), show=False)
+            plt.tight_layout(); plt.show()
+        except Exception as e:
+            messagebox.showerror("SHAP", str(e))
+
+    def show_anom(self):
+        an = self.core.anomalies(); n = len(an)
+        messagebox.showinfo("Anomalías", f"Filas anómalas: {n}")
+        if n:
+            plt.figure(figsize=(6,4))
+            sns.scatterplot(data=an, x="Temperatura(ºC)", y="Corriente(A)", color="r")
+            plt.title("Anomalías"); plt.tight_layout(); plt.show()
+
+    # ─────────── DASHBOARD PERSISTENTE (zoom/pan sincronizado) ───────────
+    def _build_dash_once(self):
+        if self._dash_built:
+            return
+        self.dash_wrap = tk.Canvas(self.tab_dash, bg="#2d2d2d", highlightthickness=0)
+        self.dash_vsb  = ttk.Scrollbar(self.tab_dash, orient="vertical", command=self.dash_wrap.yview)
+        self.dash_wrap.configure(yscrollcommand=self.dash_vsb.set)
+        self.dash_vsb.pack(side="right", fill="y")
+        self.dash_wrap.pack(fill="both", expand=True)
+        self.dash_inner = ttk.Frame(self.dash_wrap, style="Main.TFrame")
+        self.dash_wrap.create_window((0,0), window=self.dash_inner, anchor="nw")
+        self.dash_inner.bind("<Configure>", lambda e: self.dash_wrap.configure(scrollregion=self.dash_wrap.bbox("all")))
+
+        self.fig = Figure(figsize=(9,9), dpi=100)
+        self.fig.subplots_adjust(hspace=0.35)
+        axI = self.fig.add_subplot(4,1,1)
+        axP = self.fig.add_subplot(4,1,2, sharex=axI)
+        axT = self.fig.add_subplot(4,1,3, sharex=axI)
+        axD = self.fig.add_subplot(4,1,4, sharex=axI)
+        self.axes = [axI, axP, axT, axD]
+
+        self.lines = {
+            "I1": axI.plot([], [], label="I1")[0],
+            "I2": axI.plot([], [], label="I2")[0],
+            "I3": axI.plot([], [], label="I3")[0],
+            "P":  axP.plot([], [])[0],
+            "T":  axT.plot([], [])[0],
+            "D":  axD.plot([], [])[0],
+        }
+        axI.set_title("Corrientes (A)"); axI.grid(True); axI.legend()
+        axP.set_title("Potencia (kW)");  axP.grid(True)
+        axT.set_title("Temperatura (°C)"); axT.grid(True)
+        axD.set_title("Distancia (mm)");  axD.grid(True)
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.dash_inner)
+        self.canvas.draw()
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.toolbar = NavigationToolbar2Tk(self.canvas, self.dash_inner)
+        self.toolbar.update()
+
+        for ax in self.axes:
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+
+        # registrar callback para detectar zoom/pan manual
+        def on_xlim_changed(ax):
+            if not self._programmatic_xlim_change:
+                self._user_zoomed = True
+        axI.callbacks.connect('xlim_changed', on_xlim_changed)
+
+        # status lamp
+        status = ttk.Frame(self.dash_inner, style="Main.TFrame")
+        status.place(relx=0.5, y=10, anchor="n")
+        lamp = tk.Canvas(status, width=30, height=30, bg="#2d2d2d", highlightthickness=0)
+        lamp.pack(side="left", padx=6)
+        lamp.create_oval(3,3,27,27, fill="#44ff44", outline="#44ff44", tags="bulb")
+        self.status_lamp = lamp
+        self.status_txt  = ttk.Label(status, font=("Segoe UI",12,"bold"),
+                                     foreground="#44ff44", background="#2d2d2d")
+        self.status_txt.pack(side="left", padx=4)
+
+        self._dash_built = True
+
+    def _dash_reset_data(self):
+        if not self._dash_built:
+            return
+        try:
+            for key in self.lines:
+                self.lines[key].set_data([], [])
+            for ax in self.axes:
+                ax.relim(); ax.autoscale_view()
+            self._x_initialized = False
+            self.canvas.draw_idle()
+        except Exception:
+            pass
+
+    def _update_dash_lines(self, df):
+        if not self._dash_built:
+            return
+        # eje X
+        if "Fecha_Hora" in df.columns and np.issubdtype(df["Fecha_Hora"].dtype, np.datetime64):
+            x = mdates.date2num(pd.to_datetime(df["Fecha_Hora"], errors="coerce"))
+        else:
+            x = np.arange(len(df))
+
+        # corrientes (si no hay I1-3, grafico Corriente(A) en I1)
+        if {"I1 (A)","I2 (A)","I3 (A)"} <= set(df.columns):
+            self.lines["I1"].set_data(x, df["I1 (A)"].values)
+            self.lines["I2"].set_data(x, df["I2 (A)"].values)
+            self.lines["I3"].set_data(x, df["I3 (A)"].values)
+        elif "Corriente(A)" in df.columns:
+            self.lines["I1"].set_data(x, df["Corriente(A)"].values)
+            self.lines["I2"].set_data([], [])
+            self.lines["I3"].set_data([], [])
+        else:
+            self.lines["I1"].set_data([], []); self.lines["I2"].set_data([], []); self.lines["I3"].set_data([], [])
+
+        # potencia
+        if "Potencia(kW)" in df.columns:
+            self.lines["P"].set_data(x, df["Potencia(kW)"].values)
+        else:
+            self.lines["P"].set_data([], [])
+
+        # temperatura
+        if "Temperatura(ºC)" in df.columns:
+            self.lines["T"].set_data(x, df["Temperatura(ºC)"].values)
+        else:
+            self.lines["T"].set_data([], [])
+
+        # distancia
+        if "Distancia(mm)" in df.columns:
+            self.lines["D"].set_data(x, df["Distancia(mm)"].values)
+        else:
+            self.lines["D"].set_data([], [])
+
+        # autoscale Y siempre; X controlado
+        for ax in self.axes:
+            ax.relim(); ax.autoscale_view(scalex=False, scaley=True)
+
+        if len(df) > 0:
+            xmin, xmax = float(np.nanmin(x)), float(np.nanmax(x))
+            if not self._x_initialized:
+                self._programmatic_xlim_change = True
+                for ax in self.axes:
+                    ax.set_xlim(xmin, xmax)
+                self._programmatic_xlim_change = False
+                self._x_initialized = True
+            else:
+                if not self._user_zoomed:
+                    self._programmatic_xlim_change = True
+                    for ax in self.axes:
+                        ax.set_xlim(xmin, xmax)
+                    self._programmatic_xlim_change = False
+
+        # formato fechas si corresponde
+        if "Fecha_Hora" in df.columns and np.issubdtype(df["Fecha_Hora"].dtype, np.datetime64):
+            for ax in self.axes:
+                ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+
+        self.canvas.draw_idle()
+
+    def show_dash(self):
+        self._build_dash_once()
+        df = self.core.view
+        if df is None or df.empty:
+            self._dash_reset_data()
+            return
+        self.core.ensure_datetime()
+        self._update_dash_lines(self.core.view.copy())
+        self._update_status_lamp()
+
+    def _update_status_lamp(self):
+        df = self.core.view
+        if df is None or df.empty or not hasattr(self, "status_lamp"):
+            return
+        I = df["Corriente(A)"].iloc[-1]    if "Corriente(A)"    in df.columns else 0.0
+        T = df["Temperatura(ºC)"].iloc[-1] if "Temperatura(ºC)" in df.columns else 0.0
+
+        tail_I       = df["Corriente(A)"].tail(SAMPLES_I_ROJO)    if "Corriente(A)"    in df.columns else pd.Series(dtype=float)
+        tail_I_flash = df["Corriente(A)"].tail(FLASH_I_SAMPLES)   if "Corriente(A)"    in df.columns else pd.Series(dtype=float)
+        tail_T       = df["Temperatura(ºC)"].tail(SAMPLES_T_ROJO) if "Temperatura(ºC)" in df.columns else pd.Series(dtype=float)
+        tail_D       = df["Distancia(mm)"].tail(SAMPLES_CONST_2S) if "Distancia(mm)"   in df.columns else pd.Series(dtype=float)
+
+        mode = self.dist_mode.get()
+
+        # ΔD siempre respecto a 300 mm
+        tail_D_corr = (tail_D - SENSOR_OFFSET).abs()
+        if mode == "Sierra":
+            amber, red = UMBRAL_AMBAR_DIST_SIERRA, UMBRAL_ROJO_DIST_SIERRA
+        else:
+            amber, red = UMBRAL_AMBAR_DIST_BAZA, UMBRAL_ROJO_DIST_BAZA
+
+        i_roja  = (len(tail_I) == SAMPLES_I_ROJO and (tail_I >= UMBRAL_ROJO_I).all())
+        i_flash = (len(tail_I_flash) == FLASH_I_SAMPLES and (tail_I_flash >= UMBRAL_ROJO_I_FLASH).all())
+        t_roja  = (len(tail_T) == SAMPLES_T_ROJO and (tail_T >= UMBRAL_ROJO_T).all())
+
+        d_roja  = (len(tail_D_corr) == SAMPLES_CONST_2S and tail_D_corr.notna().all() and (tail_D_corr >= red).all())
+        d_ambar = (len(tail_D_corr) == SAMPLES_CONST_2S and tail_D_corr.notna().all() and (tail_D_corr >= amber).all())
+
+        i_ambar = (I > UMBRAL_AMBAR_I)
+        t_ambar = (T > UMBRAL_AMBAR_T)
+
+        # probabilidad del clasificador (independiente de RUL)
+        prob_rul = self.core.predict_live()
+        prob = 0.0
+        rul  = None
+        if prob_rul is not None:
+            p, r = prob_rul
+            if p is not None:
+                prob = p
+            rul = r
+
+        # persistencia 2 s para prob
+        self._prob_hist.append(prob)
+        prob_roja_persistente  = (len(self._prob_hist) == SAMPLES_CONST_2S and all(p >= PROB_ROJO  for p in self._prob_hist))
+        prob_ambar_persistente = (len(self._prob_hist) == SAMPLES_CONST_2S and all(p >= PROB_AMBAR for p in self._prob_hist))
+
+        if i_roja or i_flash or t_roja or d_roja or prob_roja_persistente:
+            clr, nivel = "#ff3b3b", "ALTO"
+        elif i_ambar or t_ambar or d_ambar or prob_ambar_persistente:
+            clr, nivel = "#ffe135", "MEDIO"
+        else:
+            clr, nivel = "#44ff44", "BAJO"
+
+        self.status_lamp.itemconfig("bulb", fill=clr, outline=clr)
+        ΔD = tail_D_corr.iloc[-1] if not tail_D_corr.empty else 0.0
+        txt = f"Riesgo: {nivel} ({prob:.2f}) | I={I:.1f} A  T={T:.1f} °C  ΔD={ΔD:.2f} mm"
+        if rul is not None:
+            txt += f"  RUL≈{rul:.0f}"
+        if prob_roja_persistente and (rul is not None):
+            secs = max(rul, 1) * RUL_SEC_PER_CUT
+            txt += f"  ⚠ Posible falla en {secs:.0f}s"
+
+        self.status_txt.configure(text=txt)
+
+        if clr == "#ff3b3b" and not self._last_red:
+            winsound.Beep(1000, 200)
+            self._last_red = True
+        elif clr != "#ff3b3b":
+            self._last_red = False
+
+    # ─── Reporte PDF avanzado ──────────────────────────────────────
+    def make_pdf(self):
+        try:
+            from reportlab.lib.pagesizes import A4
+            from reportlab.pdfgen import canvas as pdfcanvas
+            from reportlab.lib.units import cm
+            from reportlab.lib import colors
+        except ImportError:
+            messagebox.showwarning("PDF", "Instala reportlab: pip install reportlab")
+            return
+        if self.core.view is None or self.core.view.empty:
+            messagebox.showinfo("PDF", "Carga o simula un CSV primero"); return
+
+        tmp_imgs = []
+        def savefig_tmp(fig, name):
+            path = f"_tmp_{name}.png"
+            fig.savefig(path, dpi=140, bbox_inches="tight")
+            plt.close(fig)
+            tmp_imgs.append(path)
+            return path
+
+        info = self.core.dataset_summary()
+        dest = filedialog.asksaveasfilename(
+            title="Guardar PDF", defaultextension=".pdf", filetypes=[("PDF","*.pdf")]
+        )
+        if not dest: return
+        c = pdfcanvas.Canvas(dest, pagesize=A4); W, H = A4
+
+        # Portada / resumen
+        c.setFont("Helvetica-Bold", 18)
+        c.drawString(2*cm, H-2*cm, "Reporte de Consumo – Sierra (HMI)")
+        c.setFont("Helvetica", 11)
+        c.drawString(2*cm, H-3*cm, f"Generado: {datetime.now():%Y-%m-%d %H:%M}")
+        c.drawString(2*cm, H-4*cm, f"Filas: {info.get('rows',0)}    Δt≈{info.get('dt',float('nan')):.2f}s    f≈{info.get('hz',float('nan')):.2f} Hz")
+        if info.get("t0") and info.get("t1"):
+            c.drawString(2*cm, H-5*cm, f"Rango: {info['t0']:%Y-%m-%d %H:%M:%S}  →  {info['t1']:%Y-%m-%d %H:%M:%S}")
+        c.drawString(2*cm, H-6*cm, f"Energía total: {info.get('kwh',0):,.2f} kWh")
+        c.drawString(2*cm, H-7*cm, f"Costo (200 CLP/kWh): {info.get('cost',0):,.0f} CLP")
+        c.line(2*cm, H-7.3*cm, W-2*cm, H-7.3*cm)
+        if self.core.last_metrics:
+            self._draw_metrics_table(c, self.core.last_metrics, 2*cm, H-8.5*cm)
+        c.showPage()
+
+        # Series de tiempo
+        try:
+            self.core.ensure_datetime()
+            df = self.core.view.copy()
+            x = df["Fecha_Hora"] if "Fecha_Hora" in df.columns else np.arange(len(df))
+            fig = plt.figure(figsize=(10,9)); gs = fig.add_gridspec(4,1, hspace=0.35)
+            axI = fig.add_subplot(gs[0,0]); axP = fig.add_subplot(gs[1,0])
+            axT = fig.add_subplot(gs[2,0]); axD = fig.add_subplot(gs[3,0])
+            if {"I1 (A)","I2 (A)","I3 (A)"} <= set(df.columns):
+                axI.plot(x, df["I1 (A)"], label="I1")
+                axI.plot(x, df["I2 (A)"], label="I2")
+                axI.plot(x, df["I3 (A)"], label="I3"); axI.legend(); axI.set_title("Corrientes (A)"); axI.grid(True)
+            elif "Corriente(A)" in df:
+                axI.plot(x, df["Corriente(A)"], label="I", color=None); axI.legend(); axI.set_title("Corriente (A)"); axI.grid(True)
+            if "Potencia(kW)" in df: axP.plot(x, df["Potencia(kW)"]); axP.set_title("Potencia (kW)"); axP.grid(True)
+            if "Temperatura(ºC)" in df: axT.plot(x, df["Temperatura(ºC)"]); axT.set_title("Temperatura (°C)"); axT.grid(True)
+            if "Distancia(mm)" in df: axD.plot(x, df["Distancia(mm)"]); axD.set_title("Distancia (mm)"); axD.grid(True)
+            if "Fecha_Hora" in df.columns and np.issubdtype(df["Fecha_Hora"].dtype, np.datetime64):
+                for ax in (axI, axP, axT, axD):
+                    ax.xaxis.set_major_formatter(matplotlib.dates.DateFormatter('%H:%M:%S'))
+            path_ts = savefig_tmp(fig, "timeseries")
+            c.drawImage(path_ts, 1.5*cm, 3.2*cm, width=W-3*cm, height=H-6*cm)
+            c.showPage()
+        except Exception:
+            pass
+
+        # ROC + F1
+        curves = self.core.eval_classifiers_curves()
+        if curves:
+            fig = plt.figure(figsize=(9,6)); ax = fig.add_subplot(111)
+            for k,v in curves.items():
+                ax.plot(v["fpr"], v["tpr"], label=f"{k} (AUC={v['auc']:.3f})")
+            ax.plot([0,1],[0,1],"--",lw=1); ax.set_xlabel("FPR"); ax.set_ylabel("TPR")
+            ax.set_title("ROC – Clasificadores"); ax.grid(True); ax.legend()
+            path_roc = savefig_tmp(fig, "roc")
+            fig = plt.figure(figsize=(6,4)); ax = fig.add_subplot(111)
+            names = list(curves.keys()); vals = [curves[n]["f1"] for n in names]
+            ax.bar(names, vals); ax.set_ylim(0,1); ax.set_title("F1 (umbral 0.5)"); ax.grid(axis="y")
+            path_f1 = savefig_tmp(fig, "f1bars")
+            c.drawImage(path_roc, 1.2*cm, H/2, width=W-2.4*cm, height=H/2-2*cm)
+            c.drawImage(path_f1, 2.5*cm, 1.5*cm, width=W-5*cm, height=H/2-3*cm)
+            c.showPage()
+
+        # RUL – paridad y residuales
+        re = self.core.rul_eval_points()
+        if re:
+            y, yhat, mae = re["y"], re["yhat"], re["mae"]
+            fig = plt.figure(figsize=(6,5)); ax = fig.add_subplot(111)
+            ax.scatter(y, yhat, s=10, alpha=0.6)
+            lim = [min(y.min(),yhat.min()), max(y.max(), yhat.max())]
+            ax.plot(lim, lim, "--"); ax.set_xlabel("RUL real"); ax.set_ylabel("RUL predicho")
+            ax.set_title(f"RUL – Paridad (MAE={mae:.2f})"); ax.grid(True)
+            p1 = savefig_tmp(fig, "rul_paridad")
+            fig = plt.figure(figsize=(6,5)); ax = fig.add_subplot(111)
+            ax.hist(yhat - y, bins=30); ax.set_title("RUL – Residuales (pred - real)")
+            ax.set_xlabel("Error"); ax.set_ylabel("Frecuencia"); ax.grid(True)
+            p2 = savefig_tmp(fig, "rul_resid")
+            c.drawImage(p1, 1.2*cm, H/2, width=W/2-1.8*cm, height=H/2-2*cm)
+            c.drawImage(p2, W/2+0.6*cm, H/2, width=W/2-1.8*cm, height=H/2-2*cm)
+            c.showPage()
+
+        # Isolation Forest
+        try:
+            an = self.core.anomalies()
+            if an is not None and len(an):
+                base = self.core.view
+                fig = plt.figure(figsize=(9,6)); ax = fig.add_subplot(111)
+                if {"Temperatura(ºC)","Corriente(A)"} <= set(base.columns):
+                    ax.scatter(base["Temperatura(ºC)"], base["Corriente(A)"], s=6, alpha=0.15, label="Normal")
+                if {"Temperatura(ºC)","Corriente(A)"} <= set(an.columns):
+                    ax.scatter(an["Temperatura(ºC)"], an["Corriente(A)"], s=12, alpha=0.9, label="Anómalo")
+                ax.set_xlabel("Temperatura (°C)"); ax.set_ylabel("Corriente (A)")
+                ax.set_title(f"Isolation Forest – {len(an)} anomalías"); ax.legend(); ax.grid(True)
+                p = savefig_tmp(fig, "iforest")
+                c.drawImage(p, 1.5*cm, 2.5*cm, width=W-3*cm, height=H-5*cm)
+                c.showPage()
+        except Exception:
+            pass
+
+        # SHAP
+        try:
+            model, mtype = self.core.best_shap_model()
+            if model and self.core.features:
+                X = self.core.view[self.core.features].fillna(0)
+                Xs = X.tail(min(400, len(X)))
+                if mtype == "xgb":
+                    exp = shap.TreeExplainer(model)
+                    vals = exp.shap_values(Xs)
+                elif mtype == "logbal":
+                    f = lambda data: self.core.clf_bal.predict_proba(pd.DataFrame(data, columns=X.columns))[:,1]
+                    exp = shap.KernelExplainer(f, X.sample(min(200, len(X)), random_state=42))
+                    vals = exp.shap_values(Xs, nsamples=200)
+                else:
+                    exp = shap.LinearExplainer(model, X.sample(min(200, len(X)), random_state=42))
+                    vals = exp.shap_values(Xs)
+                shap.summary_plot(vals, X.columns.tolist(), show=False)
+                fig = plt.gcf()
+                p = savefig_tmp(fig, "shap")
+                c.drawImage(p, 1.0*cm, 2.0*cm, width=W-2.0*cm, height=H-4*cm)
+                c.showPage()
+        except Exception:
+            pass
+
+        c.save()
+        for p in tmp_imgs:
+            try: os.remove(p)
+            except Exception: pass
+        messagebox.showinfo("PDF", f"Guardado en:\n{dest}")
+
+    @staticmethod
+    def _draw_metrics_table(canvas, metrics, x0, y0, row_h=15):
+        canvas.setFont("Helvetica-Bold", 11)
+        canvas.drawString(x0,    y0,   "Métrica")
+        canvas.drawString(x0+120, y0,  "Valor")
+        canvas.setFont("Helvetica", 10)
+        y = y0 - row_h
+        for k, v in metrics.items():
+            if k.startswith("MAE"):
+                txt = f"{v[0]:.1f}"
+            elif k == "MAE_cmp":
+                txt = f"RF={v[0]:.1f} / Naive={v[1]:.1f}"
+            else:
+                txt = f"{v[0]:.3f} ± {v[1]:.3f}"
+            canvas.drawString(x0,    y, k.replace("_"," "))
+            canvas.drawString(x0+120,y, txt)
+            y -= row_h
+
+    # ───────────────────────────
+    #  HANDLER DE DATOS EN VIVO
+    # ───────────────────────────
+    def _on_live_data(self, _evt=None):
+        """
+        Se invoca cada vez que el monitor genera <<HMI_LIVE_DATA>>.
+        - Asegura que la pestaña Dashboard esté visible la primera vez.
+        - Inserta la última fila a la tabla “Datos”.
+        - Actualiza semáforo y gráficos con rate-limit (self.dash_interval).
+        """
+        df = self.core.view
+        if df is None or df.empty:
+            return
+
+        # Primera vez: construir y mostrar Dashboard automáticamente
+        if not self._dash_built:
+            try:
+                self.notebook.select(self.tab_dash)
+            except Exception:
+                pass
+            self.show_dash()
+
+        # Asegurar cabeceras de la tabla
+        if not self.tree["columns"]:
+            self.populate_table()
+        else:
+            try:
+                last = df.iloc[-1]
+                vals = [last.get(col, "") for col in self.tree["columns"]]
+                self.tree.insert("", "end", values=vals)
+            except Exception:
+                # Si algo falla, repoblar completa (más pesado)
+                self.populate_table()
+
+        # Semáforo
+        self._update_status_lamp()
+
+        # Rate-limit del refresco de curvas
+        now = int(time.time() * 1000)
+        if now >= self._next_dash_ms:
+            self._refresh_dashboard()
+            self._next_dash_ms = now + self.dash_interval
+
+    def quit(self):
+        try:
+            self.stop_simulation()
+        except Exception:
+            pass
+        self.master.destroy()
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app  = IndustrialHMI(root)
+    root.mainloop()
